@@ -1,0 +1,8 @@
+# Ignore uploaded images and CSV data
+uploads/*
+!uploads/.gitkeep
+data/aadhaar_records.csv
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,4 @@
+# Deny access to CSV data files
+<Files "*.csv">
+    Require all denied
+</Files>
