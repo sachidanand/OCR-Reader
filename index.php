@@ -3,6 +3,7 @@
  * Hans Foundation Identity Verification Tool
  * Extracts details from Indian Aadhaar Card images using Tesseract OCR
  */
+session_start();
 
 // Configuration
 $uploadDir = __DIR__ . '/uploads/';
@@ -16,77 +17,141 @@ if (!is_dir($dataDir))   mkdir($dataDir, 0755, true);
 // Create CSV with headers if it doesn't exist
 if (!file_exists($csvFile)) {
     $fp = fopen($csvFile, 'w');
-    fputcsv($fp, ['Sr No', 'Name', 'DOB', 'Gender', 'Aadhaar Number', 'Address', 'Image File', 'Processed Date'], ',', '"', '');
+    fputcsv($fp, ['Sr No', 'Name', 'DOB', 'Gender', 'Aadhaar Number', 'Address', 'Front Image', 'Back Image', 'Processed Date'], ',', '"', '');
     fclose($fp);
 }
 
 $message      = '';
 $messageType  = '';
 $extractedData = null;
-$uploadedImage = '';
+$uploadedFront = '';
+$uploadedBack  = '';
 
-// ─── PROCESS UPLOAD ────────────────────────────────────────────────────────
+// ─── POST/REDIRECT/GET PATTERN ─────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
-    if ($_POST['action'] === 'upload' && isset($_FILES['aadhaar_image'])) {
-        $file = $_FILES['aadhaar_image'];
-
-        // Validate file
+    // ── Upload front & back images ─────────────────────────────────────
+    if ($_POST['action'] === 'upload') {
         $allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/bmp', 'image/tiff'];
-        if ($file['error'] !== UPLOAD_ERR_OK) {
-            $message     = 'File upload failed. Please try again.';
-            $messageType = 'error';
-        } elseif (!in_array($file['type'], $allowedTypes)) {
-            $message     = 'Invalid file type. Please upload JPG, PNG, BMP, or TIFF images.';
-            $messageType = 'error';
-        } elseif ($file['size'] > 10 * 1024 * 1024) {
-            $message     = 'File too large. Maximum size is 10 MB.';
-            $messageType = 'error';
-        } else {
-            $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
-            $filename = 'aadhaar_' . date('Ymd_His') . '_' . uniqid() . '.' . $ext;
-            $destPath = $uploadDir . $filename;
+        $saved = [];
 
-            if (move_uploaded_file($file['tmp_name'], $destPath)) {
-                $_SESSION['uploaded_image'] = $filename;
-                $uploadedImage = $filename;
-                $message     = 'Image uploaded successfully! Click "Process Aadhaar Card" to extract details.';
-                $messageType = 'success';
+        foreach (['front_image', 'back_image'] as $field) {
+            if (!isset($_FILES[$field]) || $_FILES[$field]['error'] === UPLOAD_ERR_NO_FILE) {
+                if ($field === 'front_image') {
+                    $_SESSION['flash_message'] = 'Please upload at least the front side of the Aadhaar card.';
+                    $_SESSION['flash_type']    = 'error';
+                    header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                }
+                continue; // back is optional
+            }
+            $file = $_FILES[$field];
+            if ($file['error'] !== UPLOAD_ERR_OK) {
+                $_SESSION['flash_message'] = ucfirst(str_replace('_', ' ', $field)) . ' upload failed.';
+                $_SESSION['flash_type']    = 'error';
+                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+            }
+            if (!in_array($file['type'], $allowedTypes)) {
+                $_SESSION['flash_message'] = 'Invalid file type for ' . str_replace('_', ' ', $field) . '. Use JPG, PNG, BMP, or TIFF.';
+                $_SESSION['flash_type']    = 'error';
+                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+            }
+            if ($file['size'] > 10 * 1024 * 1024) {
+                $_SESSION['flash_message'] = ucfirst(str_replace('_', ' ', $field)) . ' is too large (max 10 MB).';
+                $_SESSION['flash_type']    = 'error';
+                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+            }
+            $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
+            $side     = ($field === 'front_image') ? 'front' : 'back';
+            $filename = 'aadhaar_' . $side . '_' . date('Ymd_His') . '_' . uniqid() . '.' . $ext;
+            if (move_uploaded_file($file['tmp_name'], $uploadDir . $filename)) {
+                $saved[$field] = $filename;
             } else {
-                $message     = 'Failed to save image. Check directory permissions.';
-                $messageType = 'error';
+                $_SESSION['flash_message'] = 'Failed to save ' . str_replace('_', ' ', $field) . '.';
+                $_SESSION['flash_type']    = 'error';
+                header('Location: ' . $_SERVER['PHP_SELF']); exit;
             }
         }
+
+        $_SESSION['uploaded_front'] = $saved['front_image'] ?? '';
+        $_SESSION['uploaded_back']  = $saved['back_image']  ?? '';
+        $_SESSION['flash_message']  = 'Image(s) uploaded successfully! Click "Process Aadhaar Card" to extract details.';
+        $_SESSION['flash_type']     = 'success';
+        header('Location: ' . $_SERVER['PHP_SELF']); exit;
     }
 
-    if ($_POST['action'] === 'process' && isset($_POST['image_file'])) {
-        $imageFile = basename($_POST['image_file']);          // sanitise
-        $imagePath = $uploadDir . $imageFile;
+    // ── Process uploaded images ────────────────────────────────────────
+    if ($_POST['action'] === 'process') {
+        $frontFile = basename($_POST['front_image'] ?? '');
+        $backFile  = basename($_POST['back_image']  ?? '');
+        $frontPath = $uploadDir . $frontFile;
 
-        if (!file_exists($imagePath)) {
-            $message     = 'Image not found. Please upload again.';
-            $messageType = 'error';
-        } else {
-            // ── Run Tesseract OCR ──────────────────────────────────────────
-            $ocrText = runOCR($imagePath);
-
-            if ($ocrText === false) {
-                $message     = 'OCR processing failed. Make sure Tesseract OCR is installed on the server.';
-                $messageType = 'error';
-            } else {
-                // Parse Aadhaar details from OCR text
-                $extractedData = parseAadhaarDetails($ocrText);
-                $extractedData['image_file'] = $imageFile;
-                $extractedData['raw_text']   = $ocrText;
-
-                // Save to CSV
-                saveToCSV($csvFile, $extractedData);
-
-                $uploadedImage = $imageFile;
-                $message       = 'Aadhaar card processed successfully!';
-                $messageType   = 'success';
-            }
+        if (!$frontFile || !file_exists($frontPath)) {
+            $_SESSION['flash_message'] = 'Front image not found. Please upload again.';
+            $_SESSION['flash_type']    = 'error';
+            header('Location: ' . $_SERVER['PHP_SELF']); exit;
         }
+
+        // OCR front image
+        $ocrFront = runOCR($frontPath);
+        if ($ocrFront === false) {
+            $_SESSION['flash_message'] = 'OCR failed on front image. Ensure Tesseract is installed.';
+            $_SESSION['flash_type']    = 'error';
+            header('Location: ' . $_SERVER['PHP_SELF']); exit;
+        }
+
+        // OCR back image (if provided)
+        $ocrBack = '';
+        if ($backFile && file_exists($uploadDir . $backFile)) {
+            $result = runOCR($uploadDir . $backFile);
+            if ($result !== false) $ocrBack = $result;
+        }
+
+        // Combine OCR text and parse
+        $combinedText = $ocrFront . "\n" . $ocrBack;
+        $data = parseAadhaarDetails($combinedText);
+        $data['front_image'] = $frontFile;
+        $data['back_image']  = $backFile;
+        $data['raw_text']    = $combinedText;
+
+        // If address not found in combined, try back text specifically
+        if (empty($data['address']) && $ocrBack) {
+            $backData = parseAadhaarDetails($ocrBack);
+            if (!empty($backData['address'])) $data['address'] = $backData['address'];
+        }
+
+        saveToCSV($csvFile, $data);
+
+        $_SESSION['extracted_data']  = $data;
+        $_SESSION['uploaded_front']  = $frontFile;
+        $_SESSION['uploaded_back']   = $backFile;
+        $_SESSION['flash_message']   = 'Aadhaar card processed successfully!';
+        $_SESSION['flash_type']      = 'success';
+        header('Location: ' . $_SERVER['PHP_SELF']); exit;
+    }
+}
+
+// ─── HANDLE RESET (upload different image) ─────────────────────────────────
+if (isset($_GET['reset'])) {
+    unset($_SESSION['uploaded_front'], $_SESSION['uploaded_back'], $_SESSION['extracted_data'],
+          $_SESSION['flash_message'], $_SESSION['flash_type']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?')); exit;
+}
+
+// ─── RESTORE FLASH DATA FROM SESSION (GET request after redirect) ──────────
+if (isset($_SESSION['flash_message'])) {
+    $message     = $_SESSION['flash_message'];
+    $messageType = $_SESSION['flash_type'];
+    unset($_SESSION['flash_message'], $_SESSION['flash_type']);
+}
+if (isset($_SESSION['extracted_data'])) {
+    $extractedData = $_SESSION['extracted_data'];
+    unset($_SESSION['extracted_data']);
+}
+if (isset($_SESSION['uploaded_front'])) {
+    $uploadedFront = $_SESSION['uploaded_front'];
+    $uploadedBack  = $_SESSION['uploaded_back'] ?? '';
+    if ($extractedData) {
+        unset($_SESSION['uploaded_front'], $_SESSION['uploaded_back']);
     }
 }
 
@@ -323,7 +388,8 @@ function saveToCSV($csvFile, $data) {
         $data['gender'],
         $data['aadhaar_number'],
         $data['address'],
-        $data['image_file'],
+        $data['front_image'],
+        $data['back_image'] ?? '',
         date('Y-m-d H:i:s'),
     ], ',', '"', '');
     fclose($fp);
@@ -335,7 +401,7 @@ function loadAllRecords($csvFile) {
     if (($fp = fopen($csvFile, 'r')) !== false) {
         $header = fgetcsv($fp, 0, ',', '"', ''); // skip header
         while (($row = fgetcsv($fp, 0, ',', '"', '')) !== false) {
-            if (count($row) >= 8) {
+            if (count($row) >= 9) {
                 $records[] = [
                     'sr_no'          => $row[0],
                     'name'           => $row[1],
@@ -343,14 +409,28 @@ function loadAllRecords($csvFile) {
                     'gender'         => $row[3],
                     'aadhaar_number' => $row[4],
                     'address'        => $row[5],
-                    'image_file'     => $row[6],
+                    'front_image'    => $row[6],
+                    'back_image'     => $row[7],
+                    'processed_date' => $row[8],
+                ];
+            } elseif (count($row) >= 8) {
+                // Legacy format (single image column)
+                $records[] = [
+                    'sr_no'          => $row[0],
+                    'name'           => $row[1],
+                    'dob'            => $row[2],
+                    'gender'         => $row[3],
+                    'aadhaar_number' => $row[4],
+                    'address'        => $row[5],
+                    'front_image'    => $row[6],
+                    'back_image'     => '',
                     'processed_date' => $row[7],
                 ];
             }
         }
         fclose($fp);
     }
-    return $records;
+    return array_reverse($records);
 }
 
 $allRecords = loadAllRecords($csvFile);
@@ -444,7 +524,7 @@ $allRecords = loadAllRecords($csvFile);
             </div>
             <div>
                 <h2>Upload Aadhaar Card</h2>
-                <p class="section-desc">Upload a clear, well-lit image of the Aadhaar card (front or back). Supported: JPG, PNG, BMP, TIFF.</p>
+                <p class="section-desc">Upload clear images of the Aadhaar card — front side (required) and back side (optional for address). Supported: JPG, PNG, BMP, TIFF.</p>
             </div>
         </div>
 
@@ -461,38 +541,75 @@ $allRecords = loadAllRecords($csvFile);
             </div>
         <?php endif; ?>
 
+        <?php
+        // Determine if we're in "preview mode" (image uploaded, not yet processed)
+        $showPreview = ($uploadedFront && !$extractedData);
+        ?>
+
+        <?php if (!$showPreview): ?>
         <form method="POST" enctype="multipart/form-data" id="uploadForm" class="upload-form">
             <input type="hidden" name="action" value="upload">
-            <div class="drop-zone" id="dropZone">
-                <input type="file" name="aadhaar_image" id="aadhaar_image" accept="image/*" required
-                       onchange="handleFileSelect(this)">
-                <div class="drop-zone-content">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                    <p class="drop-text" id="dropText">Drag &amp; drop Aadhaar card image here</p>
-                    <p class="drop-sub">or click to browse files</p>
-                    <span class="drop-formats">JPG, PNG, BMP, TIFF &middot; Max 10 MB</span>
+            <div class="drop-zone-grid">
+                <!-- Front Side -->
+                <div class="drop-zone" id="dropZoneFront">
+                    <input type="file" name="front_image" id="front_image" accept="image/*" required
+                           onchange="handleFileSelect(this, 'front')">
+                    <div class="drop-zone-content">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        <p class="drop-text" id="dropTextFront">Front Side *</p>
+                        <p class="drop-sub">Drag &amp; drop or click to browse</p>
+                        <span class="drop-formats">Required &middot; Name, DOB, Aadhaar No.</span>
+                    </div>
+                </div>
+                <!-- Back Side -->
+                <div class="drop-zone" id="dropZoneBack">
+                    <input type="file" name="back_image" id="back_image" accept="image/*"
+                           onchange="handleFileSelect(this, 'back')">
+                    <div class="drop-zone-content">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        <p class="drop-text" id="dropTextBack">Back Side</p>
+                        <p class="drop-sub">Drag &amp; drop or click to browse</p>
+                        <span class="drop-formats">Optional &middot; Address details</span>
+                    </div>
                 </div>
             </div>
             <button type="submit" class="btn btn-primary" id="uploadBtn" disabled>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                Upload Image
+                Upload Images
             </button>
         </form>
+        <?php endif; ?>
 
-        <?php if ($uploadedImage && $messageType === 'success' && !$extractedData): ?>
-            <div class="preview-section">
+        <?php if ($showPreview): ?>
+            <div class="preview-section" id="preview">
                 <h3>Image Preview</h3>
-                <div class="preview-img-wrapper">
-                    <img src="uploads/<?= htmlspecialchars($uploadedImage) ?>" alt="Aadhaar Preview" class="preview-img">
+                <div class="preview-grid">
+                    <div class="preview-img-wrapper">
+                        <span class="preview-label">Front</span>
+                        <img src="uploads/<?= htmlspecialchars($uploadedFront) ?>" alt="Front Preview" class="preview-img">
+                    </div>
+                    <?php if ($uploadedBack): ?>
+                    <div class="preview-img-wrapper">
+                        <span class="preview-label">Back</span>
+                        <img src="uploads/<?= htmlspecialchars($uploadedBack) ?>" alt="Back Preview" class="preview-img">
+                    </div>
+                    <?php endif; ?>
                 </div>
-                <form method="POST" class="process-form">
-                    <input type="hidden" name="action" value="process">
-                    <input type="hidden" name="image_file" value="<?= htmlspecialchars($uploadedImage) ?>">
-                    <button type="submit" class="btn btn-accent">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-                        Process Aadhaar Card
-                    </button>
-                </form>
+                <div class="preview-actions">
+                    <form method="POST" class="process-form" style="display:inline">
+                        <input type="hidden" name="action" value="process">
+                        <input type="hidden" name="front_image" value="<?= htmlspecialchars($uploadedFront) ?>">
+                        <input type="hidden" name="back_image" value="<?= htmlspecialchars($uploadedBack) ?>">
+                        <button type="submit" class="btn btn-accent">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                            Process Aadhaar Card
+                        </button>
+                    </form>
+                    <a href="<?= $_SERVER['PHP_SELF'] ?>?reset=1" class="btn btn-secondary">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                        Upload Different Image
+                    </a>
+                </div>
             </div>
         <?php endif; ?>
     </section>
@@ -541,7 +658,14 @@ $allRecords = loadAllRecords($csvFile);
             </div>
             <div class="report-image">
                 <h3>Uploaded Document</h3>
-                <img src="uploads/<?= htmlspecialchars($extractedData['image_file']) ?>" alt="Aadhaar Card" class="report-img">
+                <?php if (!empty($extractedData['front_image'])): ?>
+                <p class="report-img-label">Front</p>
+                <img src="uploads/<?= htmlspecialchars($extractedData['front_image']) ?>" alt="Aadhaar Front" class="report-img">
+                <?php endif; ?>
+                <?php if (!empty($extractedData['back_image'])): ?>
+                <p class="report-img-label">Back</p>
+                <img src="uploads/<?= htmlspecialchars($extractedData['back_image']) ?>" alt="Aadhaar Back" class="report-img" style="margin-top:12px">
+                <?php endif; ?>
             </div>
         </div>
     </section>
@@ -563,7 +687,6 @@ $allRecords = loadAllRecords($csvFile);
             <table class="records-table">
                 <thead>
                     <tr>
-                        <th>#</th>
                         <th>Name</th>
                         <th>DOB</th>
                         <th>Gender</th>
@@ -575,19 +698,28 @@ $allRecords = loadAllRecords($csvFile);
                 </thead>
                 <tbody>
                     <?php foreach ($allRecords as $record): ?>
-                    <tr>
-                        <td><?= htmlspecialchars($record['sr_no']) ?></td>
-                        <td class="name-cell"><?= htmlspecialchars($record['name']) ?></td>
-                        <td><?= htmlspecialchars($record['dob']) ?></td>
-                        <td><?= htmlspecialchars($record['gender']) ?></td>
-                        <td class="aadhaar-num"><?= htmlspecialchars($record['aadhaar_number']) ?></td>
-                        <td class="address-cell"><?= htmlspecialchars($record['address']) ?></td>
+                    <tr class="record-row" onclick="openRecordDetail(this)"
+                        data-name="<?= htmlspecialchars($record['name'] ?? '') ?>"
+                        data-dob="<?= htmlspecialchars($record['dob'] ?? '') ?>"
+                        data-gender="<?= htmlspecialchars($record['gender'] ?? '') ?>"
+                        data-aadhaar="<?= htmlspecialchars($record['aadhaar_number'] ?? '') ?>"
+                        data-address="<?= htmlspecialchars($record['address'] ?? '') ?>"
+                        data-front="uploads/<?= htmlspecialchars($record['front_image'] ?? '') ?>"
+                        data-back="<?= !empty($record['back_image']) ? 'uploads/' . htmlspecialchars($record['back_image']) : '' ?>"
+                        data-date="<?= htmlspecialchars($record['processed_date'] ?? '') ?>">
+                        <td class="name-cell"><?= htmlspecialchars($record['name'] ?? '') ?></td>
+                        <td><?= htmlspecialchars($record['dob'] ?? '') ?></td>
+                        <td><?= htmlspecialchars($record['gender'] ?? '') ?></td>
+                        <td class="aadhaar-num"><?= htmlspecialchars($record['aadhaar_number'] ?? '') ?></td>
+                        <td class="address-cell"><?= htmlspecialchars($record['address'] ?? '') ?></td>
                         <td>
-                            <img src="uploads/<?= htmlspecialchars($record['image_file']) ?>"
-                                 alt="Aadhaar" class="thumb-img"
-                                 onclick="window.open(this.src, '_blank')">
+                            <?php if (!empty($record['front_image'])): ?>
+                            <img src="uploads/<?= htmlspecialchars($record['front_image']) ?>"
+                                 alt="Front" class="thumb-img"
+                                 onclick="event.stopPropagation(); window.open(this.src, '_blank')">
+                            <?php endif; ?>
                         </td>
-                        <td class="date-cell"><?= htmlspecialchars($record['processed_date']) ?></td>
+                        <td class="date-cell"><?= htmlspecialchars($record['processed_date'] ?? '') ?></td>
                     </tr>
                     <?php endforeach; ?>
                 </tbody>
@@ -595,6 +727,44 @@ $allRecords = loadAllRecords($csvFile);
         </div>
     </section>
     <?php endif; ?>
+
+<!-- ── Record Detail Modal ────────────────────────────────────────── -->
+<div class="record-modal-overlay" id="recordModal" onclick="closeRecordDetail(event)">
+    <div class="record-modal">
+        <button class="modal-close" onclick="closeRecordDetail(event, true)" title="Close">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+        <div class="modal-header">
+            <div class="card-icon card-icon-success">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/></svg>
+            </div>
+            <div>
+                <h3 id="modalName">—</h3>
+                <p class="modal-sub">Aadhaar Card Details</p>
+            </div>
+        </div>
+        <div class="modal-body">
+            <div class="modal-grid">
+                <div class="modal-details">
+                    <div class="detail-row"><span class="detail-label">Name</span><span class="detail-value" id="modalNameVal">—</span></div>
+                    <div class="detail-row"><span class="detail-label">Date of Birth</span><span class="detail-value" id="modalDob">—</span></div>
+                    <div class="detail-row"><span class="detail-label">Gender</span><span class="detail-value" id="modalGender">—</span></div>
+                    <div class="detail-row"><span class="detail-label">Aadhaar No.</span><span class="detail-value aadhaar-num" id="modalAadhaar">—</span></div>
+                    <div class="detail-row"><span class="detail-label">Address</span><span class="detail-value" id="modalAddress">—</span></div>
+                    <div class="detail-row"><span class="detail-label">Processed</span><span class="detail-value" id="modalDate">—</span></div>
+                </div>
+                <div class="modal-image">
+                    <p class="report-img-label">Front</p>
+                    <img id="modalImgFront" src="" alt="Aadhaar Front" class="modal-preview-img">
+                    <div id="modalBackWrap" style="display:none; margin-top:12px">
+                        <p class="report-img-label">Back</p>
+                        <img id="modalImgBack" src="" alt="Aadhaar Back" class="modal-preview-img">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 
 </main>
 
@@ -649,45 +819,93 @@ $allRecords = loadAllRecords($csvFile);
             <p>COPYRIGHT &copy; <?= date('Y') ?> The Hans Foundation. All Rights Reserved. | 
             <a href="https://thehansfoundation.org/terms-conditions" target="_blank">Terms &amp; Conditions</a> | 
             <a href="https://thehansfoundation.org/privacy-policy" target="_blank">Privacy Policy</a> |
-            Powered by Tesseract OCR v1.0</p>
+            Powered by Tesseract OCR v1.0 | By <a href="https://www.linkedin.com/in/sachidanand-sharma/" target="_blank">Sachidanand Semwal</a></p>
         </div>
     </div>
 </footer>
 
 <!-- ─── JavaScript ──────────────────────────────────────────────────────── -->
 <script>
-// Drag & drop + file select
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('aadhaar_image');
-const dropText = document.getElementById('dropText');
-const uploadBtn = document.getElementById('uploadBtn');
+// Drag & drop + file select (dual zones)
+function initDropZone(zoneId, inputId, textId, side) {
+    const zone = document.getElementById(zoneId);
+    const input = document.getElementById(inputId);    if (!zone || !input) return; // elements not in DOM (preview mode)    const text = document.getElementById(textId);
+    if (!zone || !input) return;
 
-function handleFileSelect(input) {
+    ['dragenter', 'dragover'].forEach(e => {
+        zone.addEventListener(e, function(ev) { ev.preventDefault(); zone.classList.add('drag-over'); });
+    });
+    ['dragleave', 'drop'].forEach(e => {
+        zone.addEventListener(e, function(ev) { ev.preventDefault(); zone.classList.remove('drag-over'); });
+    });
+    zone.addEventListener('drop', function(ev) {
+        if (ev.dataTransfer.files.length) {
+            input.files = ev.dataTransfer.files;
+            handleFileSelect(input, side);
+        }
+    });
+    zone.addEventListener('click', function() { input.click(); });
+}
+
+function handleFileSelect(input, side) {
+    const zoneId = side === 'front' ? 'dropZoneFront' : 'dropZoneBack';
+    const textId = side === 'front' ? 'dropTextFront' : 'dropTextBack';
+    const zone = document.getElementById(zoneId);
+    const text = document.getElementById(textId);
     if (input.files && input.files[0]) {
-        dropText.textContent = input.files[0].name;
-        dropZone.classList.add('has-file');
+        text.textContent = input.files[0].name;
+        zone.classList.add('has-file');
+    }
+    // Enable upload button if front image is selected
+    const frontInput = document.getElementById('front_image');
+    const uploadBtn = document.getElementById('uploadBtn');
+    if (frontInput && frontInput.files && frontInput.files.length > 0) {
         uploadBtn.disabled = false;
     }
 }
 
-if (dropZone) {
-    ['dragenter', 'dragover'].forEach(e => {
-        dropZone.addEventListener(e, function(ev) { ev.preventDefault(); dropZone.classList.add('drag-over'); });
-    });
-    ['dragleave', 'drop'].forEach(e => {
-        dropZone.addEventListener(e, function(ev) { ev.preventDefault(); dropZone.classList.remove('drag-over'); });
-    });
-    dropZone.addEventListener('drop', function(ev) {
-        if (ev.dataTransfer.files.length) {
-            fileInput.files = ev.dataTransfer.files;
-            handleFileSelect(fileInput);
-        }
-    });
-    dropZone.addEventListener('click', function() { fileInput.click(); });
+initDropZone('dropZoneFront', 'front_image', 'dropTextFront', 'front');
+initDropZone('dropZoneBack', 'back_image', 'dropTextBack', 'back');
+
+// ── Record Detail Modal ──
+function openRecordDetail(row) {
+    const modal = document.getElementById('recordModal');
+    document.getElementById('modalName').textContent = row.dataset.name || '—';
+    document.getElementById('modalNameVal').textContent = row.dataset.name || '—';
+    document.getElementById('modalDob').textContent = row.dataset.dob || '—';
+    document.getElementById('modalGender').textContent = row.dataset.gender || '—';
+    document.getElementById('modalAadhaar').textContent = row.dataset.aadhaar || '—';
+    document.getElementById('modalAddress').textContent = row.dataset.address || '—';
+    document.getElementById('modalDate').textContent = row.dataset.date || '—';
+    document.getElementById('modalImgFront').src = row.dataset.front || '';
+    const backWrap = document.getElementById('modalBackWrap');
+    if (row.dataset.back) {
+        document.getElementById('modalImgBack').src = row.dataset.back;
+        backWrap.style.display = '';
+    } else {
+        backWrap.style.display = 'none';
+    }
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
 }
 
-// Smooth scroll to report after processing
-<?php if ($extractedData): ?>
+function closeRecordDetail(e, force) {
+    if (force || e.target === e.currentTarget) {
+        document.getElementById('recordModal').classList.remove('open');
+        document.body.style.overflow = '';
+    }
+}
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeRecordDetail(e, true);
+});
+
+// Smooth scroll to preview or report after upload/processing
+<?php if ($showPreview): ?>
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('preview')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+<?php elseif ($extractedData): ?>
 document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('report')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
