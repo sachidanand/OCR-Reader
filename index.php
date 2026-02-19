@@ -27,38 +27,51 @@ $extractedData = null;
 $uploadedFront = '';
 $uploadedBack  = '';
 
-// ─── POST/REDIRECT/GET PATTERN ─────────────────────────────────────────────
+// ─── HANDLE RESET (upload different image) ─────────────────────────────────
+if (isset($_GET['reset'])) {
+    unset($_SESSION['uploaded_front'], $_SESSION['uploaded_back'], $_SESSION['extracted_data'],
+          $_SESSION['flash_message'], $_SESSION['flash_type']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+// ─── POST HANDLERS ─────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
-    // ── Upload front & back images ─────────────────────────────────────
+    // ── Upload front & back images (handled inline — no redirect) ──────
     if ($_POST['action'] === 'upload') {
         $allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/bmp', 'image/tiff'];
         $saved = [];
+        $uploadOk = true;
 
         foreach (['front_image', 'back_image'] as $field) {
             if (!isset($_FILES[$field]) || $_FILES[$field]['error'] === UPLOAD_ERR_NO_FILE) {
                 if ($field === 'front_image') {
-                    $_SESSION['flash_message'] = 'Please upload at least the front side of the Aadhaar card.';
-                    $_SESSION['flash_type']    = 'error';
-                    header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                    $message = 'Please upload at least the front side of the Aadhaar card.';
+                    $messageType = 'error';
+                    $uploadOk = false;
+                    break;
                 }
                 continue; // back is optional
             }
             $file = $_FILES[$field];
             if ($file['error'] !== UPLOAD_ERR_OK) {
-                $_SESSION['flash_message'] = ucfirst(str_replace('_', ' ', $field)) . ' upload failed.';
-                $_SESSION['flash_type']    = 'error';
-                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                $message = ucfirst(str_replace('_', ' ', $field)) . ' upload failed.';
+                $messageType = 'error';
+                $uploadOk = false;
+                break;
             }
             if (!in_array($file['type'], $allowedTypes)) {
-                $_SESSION['flash_message'] = 'Invalid file type for ' . str_replace('_', ' ', $field) . '. Use JPG, PNG, BMP, or TIFF.';
-                $_SESSION['flash_type']    = 'error';
-                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                $message = 'Invalid file type for ' . str_replace('_', ' ', $field) . '. Use JPG, PNG, BMP, or TIFF.';
+                $messageType = 'error';
+                $uploadOk = false;
+                break;
             }
             if ($file['size'] > 10 * 1024 * 1024) {
-                $_SESSION['flash_message'] = ucfirst(str_replace('_', ' ', $field)) . ' is too large (max 10 MB).';
-                $_SESSION['flash_type']    = 'error';
-                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                $message = ucfirst(str_replace('_', ' ', $field)) . ' is too large (max 10 MB).';
+                $messageType = 'error';
+                $uploadOk = false;
+                break;
             }
             $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
             $side     = ($field === 'front_image') ? 'front' : 'back';
@@ -66,20 +79,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             if (move_uploaded_file($file['tmp_name'], $uploadDir . $filename)) {
                 $saved[$field] = $filename;
             } else {
-                $_SESSION['flash_message'] = 'Failed to save ' . str_replace('_', ' ', $field) . '.';
-                $_SESSION['flash_type']    = 'error';
-                header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                $message = 'Failed to save ' . str_replace('_', ' ', $field) . '.';
+                $messageType = 'error';
+                $uploadOk = false;
+                break;
             }
         }
 
-        $_SESSION['uploaded_front'] = $saved['front_image'] ?? '';
-        $_SESSION['uploaded_back']  = $saved['back_image']  ?? '';
-        $_SESSION['flash_message']  = 'Image(s) uploaded successfully! Click "Process Aadhaar Card" to extract details.';
-        $_SESSION['flash_type']     = 'success';
-        header('Location: ' . $_SERVER['PHP_SELF']); exit;
+        if ($uploadOk) {
+            $uploadedFront = $saved['front_image'] ?? '';
+            $uploadedBack  = $saved['back_image']  ?? '';
+            $message       = 'Image(s) uploaded successfully! Click "Process Aadhaar Card" to extract details.';
+            $messageType   = 'success';
+            // Also store in session in case of page refresh
+            $_SESSION['uploaded_front'] = $uploadedFront;
+            $_SESSION['uploaded_back']  = $uploadedBack;
+        }
     }
 
-    // ── Process uploaded images ────────────────────────────────────────
+    // ── Process uploaded images (PRG — redirects after processing) ─────
     if ($_POST['action'] === 'process') {
         $frontFile = basename($_POST['front_image'] ?? '');
         $backFile  = basename($_POST['back_image']  ?? '');
@@ -88,6 +106,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         if (!$frontFile || !file_exists($frontPath)) {
             $_SESSION['flash_message'] = 'Front image not found. Please upload again.';
             $_SESSION['flash_type']    = 'error';
+            session_write_close();
             header('Location: ' . $_SERVER['PHP_SELF']); exit;
         }
 
@@ -96,6 +115,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         if ($ocrFront === false) {
             $_SESSION['flash_message'] = 'OCR failed on front image. Ensure Tesseract is installed.';
             $_SESSION['flash_type']    = 'error';
+            session_write_close();
             header('Location: ' . $_SERVER['PHP_SELF']); exit;
         }
 
@@ -126,15 +146,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $_SESSION['uploaded_back']   = $backFile;
         $_SESSION['flash_message']   = 'Aadhaar card processed successfully!';
         $_SESSION['flash_type']      = 'success';
+        session_write_close();
         header('Location: ' . $_SERVER['PHP_SELF']); exit;
     }
-}
-
-// ─── HANDLE RESET (upload different image) ─────────────────────────────────
-if (isset($_GET['reset'])) {
-    unset($_SESSION['uploaded_front'], $_SESSION['uploaded_back'], $_SESSION['extracted_data'],
-          $_SESSION['flash_message'], $_SESSION['flash_type']);
-    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?')); exit;
 }
 
 // ─── RESTORE FLASH DATA FROM SESSION (GET request after redirect) ──────────
@@ -147,12 +161,12 @@ if (isset($_SESSION['extracted_data'])) {
     $extractedData = $_SESSION['extracted_data'];
     unset($_SESSION['extracted_data']);
 }
-if (isset($_SESSION['uploaded_front'])) {
+if (!$uploadedFront && isset($_SESSION['uploaded_front'])) {
     $uploadedFront = $_SESSION['uploaded_front'];
     $uploadedBack  = $_SESSION['uploaded_back'] ?? '';
-    if ($extractedData) {
-        unset($_SESSION['uploaded_front'], $_SESSION['uploaded_back']);
-    }
+}
+if ($extractedData) {
+    unset($_SESSION['uploaded_front'], $_SESSION['uploaded_back']);
 }
 
 // ─── FUNCTIONS ─────────────────────────────────────────────────────────────
@@ -828,9 +842,10 @@ $allRecords = loadAllRecords($csvFile);
 <script>
 // Drag & drop + file select (dual zones)
 function initDropZone(zoneId, inputId, textId, side) {
-    const zone = document.getElementById(zoneId);
-    const input = document.getElementById(inputId);    if (!zone || !input) return; // elements not in DOM (preview mode)    const text = document.getElementById(textId);
-    if (!zone || !input) return;
+    const zone  = document.getElementById(zoneId);
+    const input = document.getElementById(inputId);
+    if (!zone || !input) return; // elements not in DOM (preview mode)
+    const text  = document.getElementById(textId);
 
     ['dragenter', 'dragover'].forEach(e => {
         zone.addEventListener(e, function(ev) { ev.preventDefault(); zone.classList.add('drag-over'); });
@@ -844,7 +859,13 @@ function initDropZone(zoneId, inputId, textId, side) {
             handleFileSelect(input, side);
         }
     });
-    zone.addEventListener('click', function() { input.click(); });
+    // Open file picker when clicking the zone, but NOT if they clicked the input itself
+    // (the input already opens the picker natively; without this guard the picker opens twice)
+    zone.addEventListener('click', function(ev) {
+        if (ev.target !== input) { input.click(); }
+    });
+    // Stop the input's click from bubbling up to the zone
+    input.addEventListener('click', function(ev) { ev.stopPropagation(); });
 }
 
 function handleFileSelect(input, side) {
