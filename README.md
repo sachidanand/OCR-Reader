@@ -1,38 +1,16 @@
 # Hans Foundation Identity Verification Tool
 
 ## Overview
-A PHP-based web application that extracts details (Name, Address, Aadhaar Number, DOB, Gender) from Indian Aadhaar Card images using **Tesseract OCR** and stores the extracted data in a CSV file.
+A PHP-based web application that extracts details (Name, Address, Aadhaar Number, DOB, Gender) from Indian Aadhaar Card images using the **OCR.space API** and stores the extracted data in a CSV file.
 
 ## Requirements
 
 ### Server
-- PHP 7.4+ (with `exec()` enabled)
+- PHP 7.4+ (with `curl` extension enabled)
 - Apache/Nginx web server
-- **Tesseract OCR** installed on the server
 
-### Installing Tesseract OCR
-
-#### Windows
-1. Download from: https://github.com/UB-Mannheim/tesseract/wiki
-2. Install and add to PATH
-3. Optionally install Hindi language pack during setup
-
-#### Linux (Ubuntu/Debian)
-```bash
-sudo apt update
-sudo apt install tesseract-ocr tesseract-ocr-hin
-```
-
-#### macOS
-```bash
-brew install tesseract tesseract-lang
-```
-
-### Verify Tesseract Installation
-```bash
-tesseract --version
-tesseract --list-langs   # Should show 'eng' and ideally 'hin'
-```
+### OCR.space API
+This app uses the [OCR.space](https://ocr.space/) cloud API — no local OCR software required. The API key is configured in `index.php`.
 
 ## Folder Structure
 ```

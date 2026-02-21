@@ -1,7 +1,7 @@
 <?php
 /**
  * Hans Foundation Identity Verification Tool
- * Extracts details from Indian Aadhaar Card images using Tesseract OCR
+ * Extracts details from Indian Aadhaar Card images using OCR.space API
  */
 session_start();
 
@@ -75,6 +75,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
             $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
             $side     = ($field === 'front_image') ? 'front' : 'back';
+
+            // Dedup: compute hash of uploaded file to avoid saving duplicates
+            $fileHash = md5_file($file['tmp_name']);
+            $existing = findExistingUpload($uploadDir, $fileHash, $ext);
+            if ($existing) {
+                // File with identical content already exists — reuse it
+                $saved[$field] = $existing;
+                continue;
+            }
+
             $filename = 'aadhaar_' . $side . '_' . date('Ymd_His') . '_' . uniqid() . '.' . $ext;
             if (move_uploaded_file($file['tmp_name'], $uploadDir . $filename)) {
                 $saved[$field] = $filename;
@@ -110,34 +120,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             header('Location: ' . $_SERVER['PHP_SELF']); exit;
         }
 
-        // OCR front image
-        $ocrFront = runOCR($frontPath);
-        if ($ocrFront === false) {
-            $_SESSION['flash_message'] = 'OCR failed on front image. Ensure Tesseract is installed.';
+        // OCR front image — get ALL engine results
+        $ocrFrontResults = runOCR($frontPath);
+        if (empty($ocrFrontResults)) {
+            $_SESSION['flash_message'] = 'OCR failed on front image. Please try again or check the API key.';
             $_SESSION['flash_type']    = 'error';
             session_write_close();
             header('Location: ' . $_SERVER['PHP_SELF']); exit;
         }
 
-        // OCR back image (if provided)
-        $ocrBack = '';
+        // OCR back image (if provided) — get ALL engine results
+        $ocrBackResults = [];
         if ($backFile && file_exists($uploadDir . $backFile)) {
-            $result = runOCR($uploadDir . $backFile);
-            if ($result !== false) $ocrBack = $result;
+            $ocrBackResults = runOCR($uploadDir . $backFile);
         }
 
-        // Combine OCR text and parse
-        $combinedText = $ocrFront . "\n" . $ocrBack;
-        $data = parseAadhaarDetails($combinedText);
+        // Parse EACH engine result independently and merge best fields
+        $data = ['name' => '', 'dob' => '', 'gender' => '', 'aadhaar_number' => '', 'address' => ''];
+        $allRawTexts = [];
+
+        // Parse FRONT results (name, DOB, gender, aadhaar number)
+        foreach ($ocrFrontResults as $frontText) {
+            $allRawTexts[] = $frontText;
+            $parsed = parseAadhaarDetails($frontText);
+            $data = mergeBestFields($data, $parsed);
+        }
+
+        // Parse BACK results SEPARATELY — only take address from back.
+        // This prevents "Details as on: DD/MM/YYYY" on back from being
+        // misidentified as DOB.
+        $backText = implode("\n", $ocrBackResults);
+        if (!empty($ocrBackResults)) {
+            $allRawTexts[] = "---BACK---\n" . $backText;
+        }
+        foreach ($ocrBackResults as $bt) {
+            $parsed = parseAadhaarDetails($bt);
+            if (!empty($parsed['address']) && strlen($parsed['address']) > strlen($data['address'])) {
+                $data['address'] = $parsed['address'];
+            }
+            // Also take aadhaar number from back if front didn't detect it
+            if (empty($data['aadhaar_number']) && !empty($parsed['aadhaar_number'])) {
+                $data['aadhaar_number'] = $parsed['aadhaar_number'];
+            }
+        }
+
         $data['front_image'] = $frontFile;
         $data['back_image']  = $backFile;
-        $data['raw_text']    = $combinedText;
-
-        // If address not found in combined, try back text specifically
-        if (empty($data['address']) && $ocrBack) {
-            $backData = parseAadhaarDetails($ocrBack);
-            if (!empty($backData['address'])) $data['address'] = $backData['address'];
-        }
+        $data['raw_text']    = implode("\n---ENGINE---\n", $allRawTexts);
 
         saveToCSV($csvFile, $data);
 
@@ -172,53 +201,268 @@ if ($extractedData) {
 // ─── FUNCTIONS ─────────────────────────────────────────────────────────────
 
 /**
- * Run Tesseract OCR on an image and return extracted text
+ * Run OCR on an image using OCR.space API.
+ * Returns an ARRAY of ALL successful OCR text results from multiple engines.
+ * The caller will parse each result and merge the best fields.
  */
 function runOCR($imagePath) {
-    // Try Tesseract with Hindi + English languages
-    $outputBase = tempnam(sys_get_temp_dir(), 'ocr_');
-    $outputFile = $outputBase . '.txt';
+    $apiKey = 'K83915108588957';
 
-    // Try multiple Tesseract paths (Windows / Linux)
-    $tesseractPaths = [
-        'tesseract',                                                     // On PATH
-        'C:\\Program Files\\Tesseract-OCR\\tesseract.exe',               // Windows default
-        'C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe',         // Windows x86
-        '/usr/bin/tesseract',                                            // Linux
-        '/usr/local/bin/tesseract',                                      // macOS / custom
+    $attempts = [
+        ['engine' => '1', 'lang' => 'eng'],   // Engine 1, English (best for names)
+        ['engine' => '2', 'lang' => 'eng'],   // Engine 2, English (best for DOB/structure)
     ];
 
-    $executed = false;
-    foreach ($tesseractPaths as $tesseract) {
-        // Try with English + Hindi first, fall back to English only
-        $langOptions = ['eng+hin', 'eng'];
-        foreach ($langOptions as $lang) {
-            $cmd = sprintf(
-                '"%s" "%s" "%s" -l %s --psm 3 2>&1',
-                $tesseract,
-                $imagePath,
-                $outputBase,
-                $lang
-            );
-            exec($cmd, $output, $returnCode);
-            if ($returnCode === 0 && file_exists($outputFile)) {
-                $executed = true;
-                break 2;
-            }
+    $results = [];
+    foreach ($attempts as $attempt) {
+        $text = callOcrSpaceAPI($imagePath, $apiKey, $attempt['engine'], $attempt['lang']);
+        if ($text !== false && trim($text) !== '') {
+            $results[] = $text;
         }
     }
 
-    if (!$executed || !file_exists($outputFile)) {
-        // Clean up
-        @unlink($outputBase);
+    return $results; // array of strings (may be empty)
+}
+
+/**
+ * Call OCR.space API with a specific engine and language
+ */
+function callOcrSpaceAPI($imagePath, $apiKey, $engine, $lang) {
+    $apiUrl = 'https://api.ocr.space/parse/image';
+
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mimeType = finfo_file($finfo, $imagePath);
+    finfo_close($finfo);
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $apiUrl,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_HTTPHEADER     => ['apikey: ' . $apiKey],
+        CURLOPT_POSTFIELDS     => [
+            'file'              => new CURLFile($imagePath, $mimeType, basename($imagePath)),
+            'language'          => $lang,
+            'isOverlayRequired' => 'false',
+            'detectOrientation' => 'true',
+            'scale'             => 'true',
+            'OCREngine'         => $engine,
+        ],
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($response === false || $httpCode !== 200) {
+        error_log("OCR.space API error (Engine $engine, $lang): " . ($curlError ?: "HTTP $httpCode"));
         return false;
     }
 
-    $text = file_get_contents($outputFile);
-    @unlink($outputFile);
-    @unlink($outputBase);
+    $json = json_decode($response, true);
 
+    if (!$json || !empty($json['IsErroredOnProcessing'])) {
+        $errMsg = $json['ErrorMessage'][0] ?? 'Unknown API error';
+        error_log("OCR.space processing error (Engine $engine, $lang): $errMsg");
+        return false;
+    }
+
+    $text = '';
+    if (!empty($json['ParsedResults'])) {
+        foreach ($json['ParsedResults'] as $result) {
+            $text .= $result['ParsedText'] ?? '';
+        }
+    }
+
+    if (trim($text) === '') return false;
     return $text;
+}
+
+/**
+ * Score an OCR result by counting how many key Aadhaar fields are detectable.
+ * Higher score = better result. Max score = 5.
+ */
+function scoreOcrResult($text) {
+    $score = 0;
+    // Aadhaar number (XXXX XXXX XXXX)
+    if (preg_match('/\d{4}\s?\d{4}\s?\d{4}/', $text)) $score++;
+    // Date of birth (DD/MM/YYYY)
+    if (preg_match('/\d{2}[\/\-]\d{2}[\/\-]\d{4}/', $text)) $score++;
+    // Gender
+    if (preg_match('/\b(MALE|FEMALE|Male|Female|male|female|पुरुष|महिला|Transgender)\b/iu', $text)) $score++;
+    // Name-like line (2+ word alphabetic line near DOB)
+    if (preg_match('/^[A-Za-z][A-Za-z\s\.]{4,50}$/m', $text)) $score++;
+    // Address indicators
+    if (preg_match('/Address|S\/O|D\/O|W\/O|C\/O|पता|DIST|Colony|Road|Lane|Nagar|Village/iu', $text)) $score++;
+    return $score;
+}
+
+/**
+ * Merge two parsed Aadhaar results, keeping the best value for each field.
+ */
+function mergeBestFields($current, $new) {
+    // Name: prefer non-empty, non-garbled, with more real words
+    if (!empty($new['name'])) {
+        if (empty($current['name'])) {
+            $current['name'] = $new['name'];
+        } else {
+            // Prefer name with more real (3+ char) words
+            $newReal = count(array_filter(explode(' ', $new['name']), fn($w) => strlen($w) >= 3));
+            $curReal = count(array_filter(explode(' ', $current['name']), fn($w) => strlen($w) >= 3));
+            if ($newReal > $curReal) $current['name'] = $new['name'];
+        }
+    }
+    // DOB: prefer older date (DOB is always oldest date on Aadhaar)
+    if (!empty($new['dob'])) {
+        if (empty($current['dob'])) {
+            $current['dob'] = $new['dob'];
+        } else {
+            // Extract years and prefer the older one
+            preg_match('/(\d{4})/', $new['dob'], $ny);
+            preg_match('/(\d{4})/', $current['dob'], $cy);
+            if (!empty($ny[1]) && !empty($cy[1]) && (int)$ny[1] < (int)$cy[1]) {
+                $current['dob'] = $new['dob'];
+            }
+        }
+    }
+    // Gender: take first non-empty
+    if (!empty($new['gender']) && empty($current['gender'])) {
+        $current['gender'] = $new['gender'];
+    }
+    // Aadhaar: take first non-empty
+    if (!empty($new['aadhaar_number']) && empty($current['aadhaar_number'])) {
+        $current['aadhaar_number'] = $new['aadhaar_number'];
+    }
+    // Address: prefer longer address
+    if (!empty($new['address']) && strlen($new['address']) > strlen($current['address'] ?? '')) {
+        $current['address'] = $new['address'];
+    }
+    return $current;
+}
+
+/**
+ * Strip diacritics/accented characters to plain ASCII.
+ * e.g., "Slbäfma" → "Slbafma", "fåfü" → "fafu"
+ */
+function stripDiacritics($str) {
+    // Transliterate to ASCII
+    if (function_exists('transliterator_transliterate')) {
+        return transliterator_transliterate('Any-Latin; Latin-ASCII; [\u0080-\u7fff] remove', $str);
+    }
+    // Fallback: iconv
+    $result = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $str);
+    return $result !== false ? $result : $str;
+}
+
+/**
+ * Correct garbled surname via fuzzy matching against common Indian surnames.
+ *
+ * OCR frequently misreads characters with similar shapes:
+ *   h↔l, a↔b↔d, r↔f↔t, m↔rn, n↔ri, u↔v, i↔l↔1, o↔0, etc.
+ *
+ * We apply this only to the LAST word of the name (surname position)
+ * and only if it doesn't already match a known surname.
+ */
+function correctSurname($fullName) {
+    // 200+ common Indian surnames (covers major communities across India)
+    static $surnames = [
+        // North Indian
+        'Sharma', 'Verma', 'Gupta', 'Singh', 'Kumar', 'Agarwal', 'Aggarwal',
+        'Jain', 'Joshi', 'Mishra', 'Misra', 'Pandey', 'Pande', 'Dubey',
+        'Tiwari', 'Trivedi', 'Tripathi', 'Shukla', 'Srivastava', 'Srivastva',
+        'Rastogi', 'Saxena', 'Nigam', 'Mathur', 'Chaturvedi', 'Dwivedi',
+        'Upadhyay', 'Bajpai', 'Khanna', 'Kapoor', 'Kapur', 'Chopra',
+        'Malhotra', 'Bhatia', 'Sethi', 'Anand', 'Arora', 'Bahl', 'Kohli',
+        'Mehra', 'Oberoi', 'Sahni', 'Tandon', 'Walia', 'Dhawan', 'Grover',
+        'Luthra', 'Sodhi', 'Bedi', 'Gill', 'Sandhu', 'Sidhu', 'Dhillon',
+        'Grewal', 'Bajwa', 'Chauhan', 'Thakur', 'Rana', 'Rawat', 'Bisht',
+        'Negi', 'Jat', 'Yadav', 'Goel', 'Goyal', 'Mittal', 'Bansal',
+        'Jindal', 'Singhal', 'Mangal', 'Khandelwal', 'Maheshwari',
+        'Agrahari', 'Kashyap', 'Gautam', 'Maurya', 'Rajput', 'Chahar',
+        'Tanwar', 'Shekhawat', 'Rathore', 'Panwar', 'Parmar', 'Solanki',
+        'Tomar', 'Sengar', 'Bundela', 'Chandel', 'Gujjar', 'Meena',
+        'Saini', 'Choudhary', 'Chaudhary', 'Chowdhury', 'Deshpande',
+        'Semwal', 'Semval', 'Bhandari', 'Uniyal', 'Kimothi', 'Maikhuri',
+
+        // South Indian
+        'Reddy', 'Naidu', 'Raju', 'Rao', 'Nair', 'Menon', 'Pillai',
+        'Iyer', 'Iyengar', 'Krishnan', 'Subramaniam', 'Subramanian',
+        'Ramasamy', 'Murugan', 'Bhat', 'Shetty', 'Hegde', 'Kamath',
+        'Gowda', 'Patel', 'Patil', 'Kulkarni', 'Deshmukh', 'Joshi',
+        'Shinde', 'Jadhav', 'Pawar', 'More', 'Bhosale', 'Chavan',
+        'Nikam', 'Kale', 'Mane', 'Salunkhe', 'Wagh', 'Gaikwad',
+        'Deshpande', 'Jog', 'Gore', 'Apte', 'Gokhale', 'Karve',
+        'Chitnis', 'Sathe', 'Phadke', 'Tambe', 'Barde',
+
+        // East Indian
+        'Das', 'Bose', 'Ghosh', 'Sen', 'Roy', 'Dutta', 'Datta',
+        'Mukherjee', 'Banerjee', 'Chatterjee', 'Bhattacharya',
+        'Chakraborty', 'Dasgupta', 'Sengupta', 'Majumdar', 'Sarkar',
+        'Barman', 'Choudhury', 'Saha', 'Paul', 'Debnath', 'Borah',
+        'Hazarika', 'Kalita', 'Baruah', 'Gogoi', 'Deka', 'Mahanta',
+
+        // West Indian / Gujarati
+        'Shah', 'Modi', 'Desai', 'Mehta', 'Gandhi', 'Patel', 'Dave',
+        'Trivedi', 'Bhatt', 'Vyas', 'Pandya', 'Raval', 'Parikh',
+        'Naik', 'Soni', 'Thakker', 'Kothari',
+
+        // Muslim
+        'Khan', 'Ahmed', 'Syed', 'Sheikh', 'Ansari', 'Siddiqui',
+        'Qureshi', 'Rizvi', 'Farooqui', 'Hussain', 'Ali', 'Mirza',
+        'Hashmi', 'Hasan', 'Malik', 'Pathan',
+
+        // Sikh
+        'Kaur', 'Ahluwalia', 'Bajaj', 'Brar', 'Johal', 'Mann',
+        'Randhawa', 'Virk', 'Toor', 'Dhaliwal', 'Multani',
+
+        // General / pan-India
+        'Prasad', 'Ram', 'Lal', 'Devi', 'Kumari', 'Chandra',
+        'Narayan', 'Kishore', 'Mohan', 'Rajan', 'Pillai', 'Nath',
+    ];
+
+    $parts = explode(' ', $fullName);
+    if (count($parts) < 2) return $fullName;
+
+    $lastName = end($parts);
+    $lastNameLower = strtolower($lastName);
+
+    // Check if it already matches a known surname (case-insensitive)
+    foreach ($surnames as $s) {
+        if (strtolower($s) === $lastNameLower) return $fullName; // already correct
+    }
+
+    // Fuzzy match: find the closest surname
+    $bestMatch = null;
+    $bestDist  = PHP_INT_MAX;
+    $lastLen   = strlen($lastName);
+
+    foreach ($surnames as $s) {
+        // Quick filters: first letter must match, length within ±3
+        if (strtolower($s[0]) !== strtolower($lastName[0])) continue;
+        if (abs(strlen($s) - $lastLen) > 3) continue;
+
+        $dist = levenshtein(strtolower($lastName), strtolower($s));
+        if ($dist < $bestDist) {
+            $bestDist  = $dist;
+            $bestMatch = $s;
+        }
+    }
+
+    // Apply correction if distance is reasonable:
+    //   - For words ≤5 chars: allow distance ≤ 2
+    //   - For words 6-8 chars: allow distance ≤ 3
+    //   - For words 9+ chars: allow distance ≤ 4
+    $maxDist = ($lastLen <= 5) ? 2 : (($lastLen <= 8) ? 3 : 4);
+
+    if ($bestMatch !== null && $bestDist <= $maxDist && $bestDist > 0) {
+        $parts[count($parts) - 1] = ucfirst(strtolower($bestMatch));
+        return implode(' ', $parts);
+    }
+
+    return $fullName;
 }
 
 /**
@@ -238,6 +482,11 @@ function parseAadhaarDetails($text) {
         'address'        => '',
     ];
 
+    // Clean OCR artifacts: strip diacritics, normalize whitespace
+    $text = stripDiacritics($text);
+    $text = preg_replace('/[ \t]{2,}/', ' ', $text);
+    $text = preg_replace('/\r\n|\r/', "\n", $text);
+
     // Normalise: split into non-empty trimmed lines
     $lines = array_map('trim', explode("\n", $text));
     $lines = array_filter($lines, function ($l) { return $l !== ''; });
@@ -253,60 +502,152 @@ function parseAadhaarDetails($text) {
         }
     }
 
-    // ── 2. Find the DOB line index (anchor for name & gender) ──────────
+    // ── 2. Find the DOB ────────────────────────────────────────────────
+    //
+    // Strategy: Collect ALL dates from OCR text. The DOB is always the
+    // OLDEST date on the card. "Details as on" / download dates are recent.
+    // Also handle garbled separators: OCR returns 01'05/1981 or 01.05/1981
+    //
     $dobLineIdx = -1;
+    $currentYear = (int)date('Y');
+
+    // Broad date regex: handles / - ' . as separators between DD MM YYYY
+    $datePattern = '/(\d{2})[\'\/\-\.](\d{2})[\'\/ \-\.](\d{4})/';
+    // Lines that contain non-DOB dates (metadata/download/print dates)
+    $nonDobLine = '/details\s*as\s*on|download|printed|issued|generated|enrol|expiry|valid|maadhaar|online|scan|verify|vid\b|authentication/i';
+    // Fuzzy DOB label (OCR garbles DOB→OOB, D0B, etc.)
+    $dobLabel = '/D\.?O\.?B|[DO0][O0][B8]|DOB|Date\s*of\s*Birth|Birth/i';
+
+    $allDates = []; // [{date, year, lineIdx, hasLabel, isDownload}]
     foreach ($lines as $i => $line) {
-        // Match "DOB: DD/MM/YYYY" or "DOB DD/MM/YYYY" or just a date on a line with DOB/जन्म
-        if (preg_match('/DOB|जन्म|Date\s*of\s*Birth/iu', $line)) {
-            if (preg_match('/(\d{2}[\/\-]\d{2}[\/\-]\d{4})/', $line, $dm)) {
-                $data['dob'] = $dm[1];
-                $dobLineIdx = $i;
-                break;
+        if (preg_match_all($datePattern, $line, $m, PREG_SET_ORDER)) {
+            $isDownload = (bool)preg_match($nonDobLine, $line);
+            $hasLabel   = (bool)preg_match($dobLabel, $line);
+            foreach ($m as $match) {
+                $yr = (int)$match[3];
+                if ($yr >= 1900 && $yr <= $currentYear) {
+                    $normalizedDate = $match[1] . '/' . $match[2] . '/' . $match[3];
+                    $allDates[] = [
+                        'date'       => $normalizedDate,
+                        'year'       => $yr,
+                        'lineIdx'    => $i,
+                        'hasLabel'   => $hasLabel,
+                        'isDownload' => $isDownload,
+                    ];
+                }
             }
         }
     }
-    // Fallback: find any DD/MM/YYYY date
-    if ($dobLineIdx === -1) {
-        foreach ($lines as $i => $line) {
-            if (preg_match('/(\d{2}[\/\-]\d{2}[\/\-]\d{4})/', $line, $dm)) {
-                $data['dob'] = $dm[1];
-                $dobLineIdx = $i;
-                break;
-            }
-        }
+
+    // Sort: DOB-labeled first, non-download next, oldest year wins
+    usort($allDates, function ($a, $b) {
+        if ($a['hasLabel'] !== $b['hasLabel']) return $b['hasLabel'] <=> $a['hasLabel'];
+        if ($a['isDownload'] !== $b['isDownload']) return $a['isDownload'] <=> $b['isDownload'];
+        return $a['year'] <=> $b['year'];
+    });
+
+    // Filter out download/metadata dates — they are NEVER the DOB.
+    // Only use them as an absolute last resort if nothing else is found.
+    $realDates = array_filter($allDates, function ($d) {
+        return !$d['isDownload'];
+    });
+
+    if (!empty($realDates)) {
+        $realDates = array_values($realDates);
+        $data['dob']  = $realDates[0]['date'];
+        $dobLineIdx   = $realDates[0]['lineIdx'];
     }
+
     // Year-of-Birth fallback
     if (empty($data['dob'])) {
         if (preg_match('/(?:year\s*of\s*birth|yob)\s*[:\-]?\s*(\d{4})/i', $text, $dm)) {
-            $data['dob'] = $dm[1];
-        }
-    }
-
-    // ── 3. Name  (line immediately before the DOB line) ────────────────
-    if ($dobLineIdx > 0) {
-        // Walk upwards from DOB to find the English name line
-        for ($j = $dobLineIdx - 1; $j >= 0; $j--) {
-            $candidate = trim($lines[$j]);
-            // Skip empty, header, or non-name lines
-            if ($candidate === '') continue;
-            if (preg_match('/government|india|aadhaar|unique|identification|authority|uid|issued|help/i', $candidate)) continue;
-            if (preg_match('/\d/', $candidate)) continue; // has digits → not a name
-            // English name: letters & spaces, at least 2 words
-            if (preg_match('/^[A-Za-z][A-Za-z\s\.]{2,50}$/', $candidate) && preg_match('/\s/', $candidate)) {
-                $data['name'] = ucwords(strtolower(trim($candidate)));
-                // Trim "Name:" label if present
-                $data['name'] = preg_replace('/^name\s*[:\-]?\s*/i', '', $data['name']);
-                $data['name'] = trim($data['name']);
-                break;
+            $yr = (int)$dm[1];
+            if ($yr >= 1900 && $yr <= $currentYear) {
+                $data['dob'] = $dm[1];
             }
         }
     }
 
+    // ── 3. Name ────────────────────────────────────────────────────────
+    //
+    // Based on actual OCR output analysis:
+    //   Engine 1: "Sachidanand Slbafma" (line 1, before DOB)
+    //   Engine 2: "SIRE BOR" (garbled beyond use)
+    // The name is on the FIRST pure-alphabetic line with 2+ words,
+    // excluding known non-name keywords. We accept OCR imperfections
+    // in the name since it's the best the OCR can provide.
+    //
+    $nonNameWords = '/government|india|aadhaar|unique|identification|authority|uid|issued|help|download|authentication|verify|verified|online|scan|maadhaar|enrol|enrollment|print|republic|qr\b|itmo|code|resident|card|beneficiary|portal|date|birth|dob|gender|male|female|address|year|validity|vid\b|masked|official|document|valid|generate|biometric|demographic|department|ministry|electronic|digital|information|technology|www\.|http|org\b|gov\b|nic\b|uidai|proof|identity|citizenship|should|scanning|offline|details/i';
+
+    // Strategy 1: Walk upward from DOB line (name is typically 1-2 lines above)
+    if ($dobLineIdx > 0) {
+        for ($j = $dobLineIdx - 1; $j >= max(0, $dobLineIdx - 4); $j--) {
+            $candidate = trim($lines[$j]);
+            if ($candidate === '') continue;
+            if (preg_match('/\d/', $candidate)) continue;
+
+            $cleaned = preg_replace('/[^A-Za-z\s\.]/', '', $candidate);
+            $cleaned = trim(preg_replace('/\s+/', ' ', $cleaned));
+            if (strlen($cleaned) < 4) continue;
+            if (!preg_match('/\s/', $cleaned)) continue;
+            if (!preg_match('/^[A-Z]/', $cleaned)) continue;
+            if (preg_match($nonNameWords, $cleaned)) continue;
+
+            $words = explode(' ', $cleaned);
+            $realWords = array_filter($words, fn($w) => strlen($w) >= 2);
+            if (count($realWords) < 2) continue;
+
+            $data['name'] = ucwords(strtolower($cleaned));
+            $data['name'] = preg_replace('/^name\s*[:\-]?\s*/i', '', $data['name']);
+            $data['name'] = trim($data['name']);
+            break;
+        }
+    }
+
+    // Strategy 2: First alphabetic 2+ word line in the entire text
+    //             (for cards where DOB line wasn't found or name is above it)
+    if (empty($data['name'])) {
+        foreach ($lines as $i => $line) {
+            if (preg_match('/\d/', $line)) continue;
+            $cleaned = preg_replace('/[^A-Za-z\s\.]/', '', $line);
+            $cleaned = trim(preg_replace('/\s+/', ' ', $cleaned));
+            if (strlen($cleaned) < 4) continue;
+            if (!preg_match('/\s/', $cleaned)) continue;
+            if (!preg_match('/^[A-Z]/', $cleaned)) continue;
+            if (preg_match($nonNameWords, $cleaned)) continue;
+
+            $words = explode(' ', $cleaned);
+            $realWords = array_filter($words, fn($w) => strlen($w) >= 2);
+            if (count($realWords) < 2) continue;
+
+            $data['name'] = ucwords(strtolower($cleaned));
+            break;
+        }
+    }
+
+    // Strategy 3: Look for explicit "Name:" label
+    if (empty($data['name'])) {
+        if (preg_match('/(?:Name)\s*[:\-]\s*([A-Za-z][A-Za-z\s\.]{2,50})/i', $text, $nm)) {
+            $candidate = ucwords(strtolower(trim($nm[1])));
+            if (!preg_match($nonNameWords, $candidate)) {
+                $data['name'] = $candidate;
+            }
+        }
+    }
+
+    // ── 3b. Surname correction via fuzzy matching ──────────────────────
+    //  OCR often garbles surnames (e.g. "Sharma" → "Slbafma") due to
+    //  character-shape confusions (h→l, a→b, r→f). We fuzzy-match the
+    //  last word against a dictionary of common Indian surnames.
+    if (!empty($data['name'])) {
+        $data['name'] = correctSurname($data['name']);
+    }
+
     // ── 4. Gender  (line immediately after the DOB line) ───────────────
-    //    Also search nearby lines and full text for MALE/FEMALE
+    //    Search nearby lines, full text, and handle OCR misreads
     if ($dobLineIdx >= 0) {
-        // Check a few lines after DOB
-        for ($j = $dobLineIdx; $j <= min($dobLineIdx + 3, $lineCount - 1); $j++) {
+        // Check a few lines after DOB (expand range for API output which may merge lines)
+        for ($j = $dobLineIdx; $j <= min($dobLineIdx + 5, $lineCount - 1); $j++) {
             if (preg_match('/\b(MALE|FEMALE|Male|Female|male|female|पुरुष|महिला|Transgender)\b/iu', $lines[$j], $gm)) {
                 $data['gender'] = normalizeGender($gm[1]);
                 break;
@@ -317,6 +658,23 @@ function parseAadhaarDetails($text) {
     if (empty($data['gender'])) {
         if (preg_match('/\b(MALE|FEMALE|Male|Female|male|female|पुरुष|महिला|Transgender)\b/iu', $text, $gm)) {
             $data['gender'] = normalizeGender($gm[1]);
+        }
+    }
+    // Fallback: handle common OCR misreads of MALE/FEMALE
+    if (empty($data['gender'])) {
+        // OCR often misreads MALE as MAIE, MАЛЕ, etc.
+        if (preg_match('/\b(MA[LI1|]E|FEMA[LI1|]E|FE\.?MALE)\b/i', $text, $gm)) {
+            $raw = strtoupper($gm[1]);
+            $data['gender'] = (strpos($raw, 'FE') === 0) ? 'Female' : 'Male';
+        }
+    }
+    // Fallback: look for Gender/लिंग label
+    if (empty($data['gender'])) {
+        if (preg_match('/(?:Gender|Sex|लिंग)\s*[:\-]?\s*(Male|Female|MALE|FEMALE|पुरुष|महिला|M|F)\b/iu', $text, $gm)) {
+            $val = strtoupper(trim($gm[1]));
+            if ($val === 'M' || $val === 'MALE' || $gm[1] === 'पुरुष') $data['gender'] = 'Male';
+            elseif ($val === 'F' || $val === 'FEMALE' || $gm[1] === 'महिला') $data['gender'] = 'Female';
+            else $data['gender'] = normalizeGender($gm[1]);
         }
     }
 
@@ -387,25 +745,75 @@ function normalizeGender($raw) {
 }
 
 /**
- * Save extracted data to CSV
+ * Find an existing upload with the same content hash to avoid duplicates.
+ * Returns the filename if found, or false.
+ */
+function findExistingUpload($uploadDir, $hash, $ext) {
+    $pattern = $uploadDir . 'aadhaar_*.' . $ext;
+    foreach (glob($pattern) as $path) {
+        if (md5_file($path) === $hash) {
+            return basename($path);
+        }
+    }
+    return false;
+}
+
+/**
+ * Save extracted data to CSV (upsert: update existing row if same Aadhaar number, else append).
  */
 function saveToCSV($csvFile, $data) {
-    // Determine serial number
-    $rows = file($csvFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    $srNo = max(1, count($rows));   // header is row 1
+    $rows = [];
+    $header = null;
+    $updated = false;
+    $aadhaarToMatch = preg_replace('/\s+/', '', $data['aadhaar_number'] ?? '');
 
-    $fp = fopen($csvFile, 'a');
-    fputcsv($fp, [
-        $srNo,
-        $data['name'],
-        $data['dob'],
-        $data['gender'],
-        $data['aadhaar_number'],
-        $data['address'],
-        $data['front_image'],
-        $data['back_image'] ?? '',
-        date('Y-m-d H:i:s'),
-    ], ',', '"', '');
+    // Read all existing rows
+    if (($fp = fopen($csvFile, 'r')) !== false) {
+        $header = fgetcsv($fp, 0, ',', '"', '');
+        while (($row = fgetcsv($fp, 0, ',', '"', '')) !== false) {
+            $existingAadhaar = preg_replace('/\s+/', '', $row[4] ?? '');
+            // If same Aadhaar number — update in place
+            if ($aadhaarToMatch && $existingAadhaar === $aadhaarToMatch) {
+                $row = [
+                    $row[0],  // keep original Sr No
+                    $data['name'],
+                    $data['dob'],
+                    $data['gender'],
+                    $data['aadhaar_number'],
+                    $data['address'],
+                    $data['front_image'],
+                    $data['back_image'] ?? '',
+                    date('Y-m-d H:i:s'),
+                ];
+                $updated = true;
+            }
+            $rows[] = $row;
+        }
+        fclose($fp);
+    }
+
+    if (!$updated) {
+        // Append new row
+        $srNo = count($rows) + 1;
+        $rows[] = [
+            $srNo,
+            $data['name'],
+            $data['dob'],
+            $data['gender'],
+            $data['aadhaar_number'],
+            $data['address'],
+            $data['front_image'],
+            $data['back_image'] ?? '',
+            date('Y-m-d H:i:s'),
+        ];
+    }
+
+    // Rewrite the entire CSV
+    $fp = fopen($csvFile, 'w');
+    if ($header) fputcsv($fp, $header, ',', '"', '');
+    foreach ($rows as $row) {
+        fputcsv($fp, $row, ',', '"', '');
+    }
     fclose($fp);
 }
 
@@ -780,6 +1188,26 @@ $allRecords = loadAllRecords($csvFile);
     </div>
 </div>
 
+<!-- ── Processing Progress Overlay ────────────────────────────────── -->
+<div class="progress-overlay" id="progressOverlay">
+    <div class="progress-modal">
+        <div class="progress-spinner">
+            <svg width="56" height="56" viewBox="0 0 56 56">
+                <circle cx="28" cy="28" r="24" fill="none" stroke="#e5e7eb" stroke-width="5"/>
+                <circle cx="28" cy="28" r="24" fill="none" stroke="#2563eb" stroke-width="5"
+                        stroke-dasharray="150.8" stroke-dashoffset="50" stroke-linecap="round"
+                        class="progress-ring"/>
+            </svg>
+        </div>
+        <h3 class="progress-title" id="progressTitle">Processing Aadhaar Card</h3>
+        <p class="progress-step" id="progressStep">Initializing...</p>
+        <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="progressBarFill"></div>
+        </div>
+        <p class="progress-note">This may take 15–30 seconds. Please do not close the page.</p>
+    </div>
+</div>
+
 </main>
 
 <!-- ─── FOOTER ──────────────────────────────────────────────────────────── -->
@@ -833,7 +1261,7 @@ $allRecords = loadAllRecords($csvFile);
             <p>COPYRIGHT &copy; <?= date('Y') ?> The Hans Foundation. All Rights Reserved. | 
             <a href="https://thehansfoundation.org/terms-conditions" target="_blank">Terms &amp; Conditions</a> | 
             <a href="https://thehansfoundation.org/privacy-policy" target="_blank">Privacy Policy</a> |
-            Powered by Tesseract OCR v1.0 | By <a href="https://www.linkedin.com/in/sachidanand-sharma/" target="_blank">Sachidanand Semwal</a></p>
+            Powered by OCR.space API v1.0 | By <a href="https://www.linkedin.com/in/sachidanand-sharma/" target="_blank">Sachidanand Semwal</a></p>
         </div>
     </div>
 </footer>
@@ -920,6 +1348,52 @@ function closeRecordDetail(e, force) {
 document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') closeRecordDetail(e, true);
 });
+
+// ── Processing Progress Overlay ──
+(function() {
+    const processForm = document.querySelector('.process-form');
+    if (!processForm) return;
+
+    processForm.addEventListener('submit', function(e) {
+        const overlay = document.getElementById('progressOverlay');
+        const stepEl  = document.getElementById('progressStep');
+        const barFill = document.getElementById('progressBarFill');
+        const titleEl = document.getElementById('progressTitle');
+
+        overlay.classList.add('open');
+        document.body.style.overflow = 'hidden';
+
+        const steps = [
+            { text: 'Uploading images to OCR service...', pct: 10, delay: 0 },
+            { text: 'Running OCR Engine 1 (English) on front image...', pct: 25, delay: 2000 },
+            { text: 'Running OCR Engine 2 (English) on front image...', pct: 40, delay: 6000 },
+            { text: 'Running OCR Engine 1 (English) on back image...', pct: 55, delay: 10000 },
+            { text: 'Running OCR Engine 2 (English) on back image...', pct: 70, delay: 14000 },
+            { text: 'Parsing and merging OCR results...', pct: 85, delay: 18000 },
+            { text: 'Correcting names and saving record...', pct: 95, delay: 21000 },
+        ];
+
+        steps.forEach(function(s) {
+            setTimeout(function() {
+                stepEl.textContent = s.text;
+                barFill.style.width = s.pct + '%';
+            }, s.delay);
+        });
+    });
+})();
+
+// Also show a brief spinner on Upload button click
+(function() {
+    const uploadForm = document.getElementById('uploadForm');
+    if (!uploadForm) return;
+    uploadForm.addEventListener('submit', function() {
+        const btn = document.getElementById('uploadBtn');
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<span class="btn-spinner"></span> Uploading...';
+        }
+    });
+})();
 
 // Smooth scroll to preview or report after upload/processing
 <?php if ($showPreview): ?>
